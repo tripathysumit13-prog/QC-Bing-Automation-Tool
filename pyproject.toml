@@ -1,0 +1,15 @@
+[project]
+name = "qc-bing-automation-tool"
+version = "0.1.0"
+description = "Minimum viable product for Bing Ads account QC automation"
+authors = [{name = "QC Automation Team"}]
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+dev = []
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"

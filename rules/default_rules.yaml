@@ -1,0 +1,63 @@
+[
+  {
+    "id": "MSCLKID_AUTOTAG",
+    "name": "MSCLKID auto-tagging enabled",
+    "description": "Ensure MSCLKID auto-tagging is enabled for accurate attribution.",
+    "severity": "CRITICAL",
+    "type": "boolean_true",
+    "target": "account.settings.msclkidAutoTagging",
+    "remediation": "Enable auto-tagging in Microsoft Ads > Account Settings."
+  },
+  {
+    "id": "CAMPAIGN_NAMING",
+    "name": "Campaign naming convention",
+    "description": "Campaign names must follow the Brand_Market_Intent template.",
+    "severity": "MAJOR",
+    "type": "regex",
+    "target": "account.metadata.campaignNamingConvention",
+    "remediation": "Update naming convention to Brand_Market_Intent.",
+    "params": {
+      "pattern": "^(Brand|NonBrand)_[A-Z]{2}_[A-Za-z0-9-]+$"
+    }
+  },
+  {
+    "id": "ADGROUP_HAS_ADS",
+    "name": "Ad groups contain ads",
+    "description": "Each ad group must contain at least one responsive search ad.",
+    "severity": "CRITICAL",
+    "type": "collection_field_min",
+    "target": "campaigns",
+    "remediation": "Create at least one responsive search ad in each ad group before launch.",
+    "params": {
+      "field": "ads",
+      "min": 1,
+      "entity_type": "AD_GROUP"
+    }
+  },
+  {
+    "id": "ADGROUP_HAS_KEYWORDS",
+    "name": "Ad groups contain keywords",
+    "description": "Ensure ad groups have at least one active keyword.",
+    "severity": "MAJOR",
+    "type": "collection_field_min",
+    "target": "campaigns",
+    "remediation": "Add keywords to empty ad groups or pause them.",
+    "params": {
+      "field": "keywords",
+      "min": 1,
+      "entity_type": "AD_GROUP"
+    }
+  },
+  {
+    "id": "SITELINK_COUNT",
+    "name": "Sitelink coverage",
+    "description": "Accounts should have at least four sitelinks configured.",
+    "severity": "MINOR",
+    "type": "min_count",
+    "target": "account.assets.sitelinks",
+    "remediation": "Add sitelinks so at least four are available for launch.",
+    "params": {
+      "min": 4
+    }
+  }
+]

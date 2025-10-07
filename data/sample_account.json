@@ -1,0 +1,35 @@
+{
+  "accountId": "1234567890",
+  "account": {
+    "settings": {
+      "msclkidAutoTagging": false
+    },
+    "metadata": {
+      "campaignNamingConvention": "Brand_US_Search"
+    },
+    "assets": {
+      "sitelinks": [
+        {"id": "sl1"},
+        {"id": "sl2"}
+      ]
+    }
+  },
+  "campaigns": [
+    {
+      "id": "cmp1",
+      "name": "Launch Campaign",
+      "ads": [
+        {"id": "ad1", "type": "RSA"}
+      ],
+      "keywords": []
+    },
+    {
+      "id": "cmp2",
+      "name": "Support Campaign",
+      "ads": [],
+      "keywords": [
+        {"id": "kw1", "text": "brand shoes"}
+      ]
+    }
+  ]
+}
