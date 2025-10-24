@@ -1,1 +1,347 @@
-# bing-ads-qc-agent
+# Minimal, single-file QC MVP (run:  python qc_mvp.py --html report.html --json report.json)
+import os, re, json, argparse
+from enum import Enum
+from dataclasses import dataclass, field
+from typing import Any, Dict, List
+
+# ---------- Models ----------
+class Severity(str, Enum):
+    CRITICAL = "CRITICAL"   # Red
+    MAJOR    = "MAJOR"      # Yellow
+    PASS     = "PASS"       # Green
+
+@dataclass
+class Finding:
+    rule_id: str
+    severity: Severity
+    entity_type: str
+    entity_id: str
+    message: str
+    recommendation: str
+    evidence: Dict[str, Any] = field(default_factory=dict)
+
+WEIGHTS = {Severity.CRITICAL: 15, Severity.MAJOR: 5, Severity.PASS: 0}
+
+@dataclass
+class Score:
+    score: int
+    status: str       # LAUNCH_READY / REVIEW_REQUIRED / FAIL
+    passed: int
+    total: int
+
+# ---------- Microsoft Ads fetch ----------
+from bingads.authorization import AuthorizationData, OAuthDesktopMobileAuthCodeGrant
+from bingads.service_client import ServiceClient
+API_VERSION = 13
+
+def _env(name, required=True):
+    v = os.getenv(name)
+    if required and not v:
+        raise RuntimeError(f"Missing env var: {name}")
+    return v or ""
+
+def build_auth() -> AuthorizationData:
+    developer_token = _env("BING_ADS_DEVELOPER_TOKEN")
+    client_id = _env("BING_ADS_CLIENT_ID")
+    redirect_uri = _env("BING_ADS_REDIRECT_URI")
+    account_id = int(_env("BING_ADS_ACCOUNT_ID"))
+    customer_id = int(_env("BING_ADS_CUSTOMER_ID"))
+    client_secret = _env("BING_ADS_CLIENT_SECRET", required=False)
+    refresh_token = _env("BING_ADS_REFRESH_TOKEN", required=False)
+    auth_code = _env("BING_ADS_AUTH_CODE", required=False)
+
+    oauth = OAuthDesktopMobileAuthCodeGrant(client_id=client_id, client_secret=client_secret, redirection_uri=redirect_uri)
+    if refresh_token:
+        oauth.request_oauth_tokens_by_refresh_token(refresh_token)
+    elif auth_code:
+        oauth.finalize_auth_code_grant(auth_code)
+        if oauth.oauth_tokens.refresh_token:
+            print("Save this refresh token:\n", oauth.oauth_tokens.refresh_token)
+    else:
+        raise RuntimeError("Provide BING_ADS_REFRESH_TOKEN or one-time BING_ADS_AUTH_CODE")
+
+    return AuthorizationData(
+        account_id=account_id, customer_id=customer_id,
+        developer_token=developer_token, authentication=oauth
+    )
+
+def _svc(auth, name):  # quick client
+    return ServiceClient(service=name, version=API_VERSION, authorization_data=auth, environment="production")
+
+def _unwrap(obj: Any, many: str, one: str) -> List[Any]:
+    if obj is None: return []
+    if isinstance(obj, dict):
+        arr = obj.get(many, {})
+        out = arr.get(one, []) if isinstance(arr, dict) else arr
+        if out is None: return []
+        return out if isinstance(out, list) else [out]
+    if hasattr(obj, many): obj = getattr(obj, many)
+    if hasattr(obj, one):
+        arr = getattr(obj, one)
+        if arr is None: return []
+        return arr if isinstance(arr, list) else [arr]
+    try: return list(obj)
+    except TypeError: return [obj]
+
+def get_account_props(auth) -> Dict[str, str]:
+    svc = _svc(auth, "CustomerManagementService")
+    out = {}
+    try:
+        props = svc.GetAccountProperties(
+            AccountId=auth.account_id,
+            AccountPropertyNames={"AccountPropertyName": ["AutoTaggingEnabled","TimeZone","CurrencyCode"]},
+        )
+        items = []
+        if hasattr(props, "AccountProperties") and hasattr(props.AccountProperties, "AccountProperty"):
+            items = props.AccountProperties.AccountProperty
+        elif hasattr(props, "AccountProperty"): items = props.AccountProperty
+        if items and not isinstance(items, list): items = [items]
+        for p in items or []:
+            out[str(getattr(p,"Name",""))] = str(getattr(p,"Value",""))
+    except Exception as e:
+        print("Warn: account properties:", e)
+    return out
+
+def get_campaigns(auth):
+    svc = _svc(auth, "CampaignManagementService")
+    res = svc.GetCampaignsByAccountId(AccountId=auth.account_id, CampaignType=["Search","Shopping","DynamicSearchAds","Audience"])
+    return _unwrap(res, "Campaigns", "Campaign")
+
+def get_ad_groups(auth, campaign_id: int):
+    svc = _svc(auth, "CampaignManagementService")
+    res = svc.GetAdGroupsByCampaignId(CampaignId=campaign_id)
+    return _unwrap(res, "AdGroups", "AdGroup")
+
+def get_ads(auth, ad_group_id: int):
+    svc = _svc(auth, "CampaignManagementService")
+    res = svc.GetAdsByAdGroupId(AdGroupId=ad_group_id, AdTypes={"AdType":["ResponsiveSearchAd","ExpandedTextAd"]})
+    return _unwrap(res, "Ads", "Ad")
+
+def get_keywords(auth, ad_group_id: int):
+    svc = _svc(auth, "CampaignManagementService")
+    res = svc.GetKeywordsByAdGroupId(AdGroupId=ad_group_id)
+    return _unwrap(res, "Keywords", "Keyword")
+
+# ---------- QC rules ----------
+def _get(o,n,d=None): return o.get(n,d) if isinstance(o,dict) else getattr(o,n,d)
+def _id(o): return str(_get(o,"Id",""))
+def _name(o): return str(_get(o,"Name",""))
+
+def evaluate(snapshot: Dict, naming_regex: str) -> List[Finding]:
+    f: List[Finding] = []
+    acct_id = snapshot["account_id"]
+    acct_props = snapshot["account_props"]
+    campaigns = snapshot["campaigns"]
+    ag_by_c = snapshot["ad_groups_by_campaign"]
+    ads_by_ag = snapshot["ads_by_ag"]
+    kws_by_ag = snapshot["kws_by_ag"]
+    naming_re = re.compile(naming_regex) if naming_regex else None
+
+    # 1) Structure & naming
+    for c in campaigns:
+        cname = _name(c)
+        if naming_re and not naming_re.match(cname):
+            f.append(Finding("NAME_PATTERN_CAMPAIGN", Severity.MAJOR, "CAMPAIGN", _id(c),
+                             f"Campaign name '{cname}' does not match template.",
+                             "Use Platform_CampaignType_Objective_Targeting_Details"))
+        if len(ag_by_c.get(_id(c), [])) == 0:
+            f.append(Finding("EMPTY_CAMPAIGN", Severity.CRITICAL, "CAMPAIGN", _id(c),
+                             "Campaign has no ad groups.", "Add ≥1 ad group."))
+
+    # 2) Keyword hygiene
+    # 2a) ad group has >=1 keyword
+    for cid, ags in ag_by_c.items():
+        for ag in ags:
+            kws = kws_by_ag.get(_id(ag), [])
+            if len(kws) == 0:
+                f.append(Finding("EMPTY_ADGROUP_KEYWORDS", Severity.CRITICAL, "AD_GROUP", _id(ag),
+                                 f"Ad group '{_name(ag)}' has 0 keywords.", "Add ≥1 keyword."))
+            else:
+                f.append(Finding("HAS_KEYWORDS", Severity.PASS, "AD_GROUP", _id(ag),
+                                 f"Ad group '{_name(ag)}' has {len(kws)} keyword(s).", "None."))
+    # 2b) duplicates across account
+    def key(kw): 
+        text = (_get(kw,"Text","") or "").strip().lower()
+        mt = str(_get(kw,"MatchType","")).lower()
+        return f"{text}|{mt}"
+    seen = {}
+    for agid, kws in kws_by_ag.items():
+        for kw in kws:
+            k = key(kw)
+            if not k or k.startswith("|"): continue
+            seen.setdefault(k, []).append({"ag": agid, "text": (_get(kw,"Text","") or "").lower(), "match": str(_get(kw,"MatchType","")).lower()})
+    dups = {k:v for k,v in seen.items() if len(v)>1}
+    if dups:
+        for k, occ in dups.items():
+            f.append(Finding("DUPLICATE_KEYWORDS", Severity.MAJOR, "ACCOUNT", acct_id,
+                             f"Keyword '{occ[0]['text']}' [{occ[0]['match']}] duplicated in {len(occ)} ad groups.",
+                             "Deduplicate to avoid self-competition.", {"examples": occ[:10]}))
+    else:
+        f.append(Finding("NO_DUPLICATE_KEYWORDS", Severity.PASS, "ACCOUNT", acct_id,
+                         "No duplicate keywords across ad groups.", "None."))
+
+    # 2c) match-type spread (warn if single type and >3 kws)
+    for cid, ags in ag_by_c.items():
+        for ag in ags:
+            types = {str(_get(k,"MatchType","")).lower() for k in kws_by_ag.get(_id(ag), []) if _get(k,"MatchType",None)}
+            if len(types)<=1 and len(kws_by_ag.get(_id(ag),[]))>3:
+                f.append(Finding("MATCHTYPE_SPREAD", Severity.MAJOR, "AD_GROUP", _id(ag),
+                                 f"Limited match-type diversity: {sorted(list(types)) or ['n/a']}.",
+                                 "Use a deliberate mix: Exact/Phrase/Broad."))
+            else:
+                f.append(Finding("MATCHTYPE_OK", Severity.PASS, "AD_GROUP", _id(ag),
+                                 f"Match-type spread OK: {sorted(list(types))}.","None."))
+
+    # 3) Ads & ad strength
+    for cid, ags in ag_by_c.items():
+        for ag in ags:
+            ads = ads_by_ag.get(_id(ag), [])
+            if len(ads)==0:
+                f.append(Finding("ADLESS_ADGROUP", Severity.CRITICAL, "AD_GROUP", _id(ag),
+                                 f"No ads in '{_name(ag)}'.", "Create ≥1 RSA."))
+            else:
+                has_rsa = any((_get(a,"Type","")=="ResponsiveSearchAd") for a in ads)
+                if not has_rsa:
+                    f.append(Finding("RSA_MISSING", Severity.MAJOR, "AD_GROUP", _id(ag),
+                                     "No Responsive Search Ad present.", "Add ≥1 RSA (≥12 H1, ≥4 desc)."))
+                else:
+                    f.append(Finding("RSA_PRESENT", Severity.PASS, "AD_GROUP", _id(ag), "RSA present.", "None."))
+                # crude ad strength pass if field exists
+                for a in ads:
+                    st = str(_get(a,"AdStrength","") or _get(a,"EditorialStatus","")).lower()
+                    if st in ("excellent","good"):
+                        f.append(Finding("AD_STRENGTH", Severity.PASS, "AD", _id(a), f"Ad strength {st}.", "None."))
+                    elif st in ("average","poor"):
+                        f.append(Finding("AD_STRENGTH", Severity.MAJOR, "AD", _id(a), f"Ad strength {st}.", "Improve assets."))
+
+    # 4) Tracking
+    auto = (acct_props.get("AutoTaggingEnabled","").lower())
+    if auto == "true":
+        f.append(Finding("MSCLKID_AUTOTAG", Severity.PASS, "ACCOUNT", acct_id, "MSCLKID auto-tagging enabled.","None."))
+    elif auto == "false":
+        f.append(Finding("MSCLKID_AUTOTAG", Severity.CRITICAL, "ACCOUNT", acct_id, "MSCLKID auto-tagging disabled.","Enable in Account Settings."))
+
+    # 5) Settings (heuristics)
+    for c in campaigns:
+        budget = float(_get(c,"DailyBudget", _get(c,"BudgetAmount", 0)) or 0)
+        if budget<=0:
+            f.append(Finding("BUDGET_ZERO", Severity.CRITICAL, "CAMPAIGN", _id(c), "Daily budget is zero.","Set non-zero budget."))
+        else:
+            f.append(Finding("BUDGET_OK", Severity.PASS, "CAMPAIGN", _id(c), f"Budget {budget}.","None."))
+        langs = _get(c,"Languages",[]) or []
+        if "English" in str(langs):
+            f.append(Finding("LANGUAGE_ENGLISH", Severity.PASS, "CAMPAIGN", _id(c), "Language English.","None."))
+        else:
+            f.append(Finding("LANGUAGE_NOT_EN", Severity.MAJOR, "CAMPAIGN", _id(c), "Language not set to English.","Set English for launch."))
+        # device modifiers zero?
+        mods = _get(c,"DeviceBidAdjustments",[]) or []
+        if any((_get(m,"BidAdjustment",0)!=0) for m in mods):
+            f.append(Finding("DEVICE_MODIFIERS", Severity.MAJOR, "CAMPAIGN", _id(c), "Device bid adjustments not zero.","Set to 0% for launch."))
+        else:
+            f.append(Finding("DEVICE_MODIFIERS_OK", Severity.PASS, "CAMPAIGN", _id(c), "Device modifiers at 0%.","None."))
+        # bidding scheme heuristic
+        bs = str(_get(c,"BiddingScheme",{})).lower()
+        if "enhanced" in bs or "ecpc" in bs:
+            f.append(Finding("BID_ECPC", Severity.PASS, "CAMPAIGN", _id(c), "Bidding: eCPC.","None."))
+        else:
+            f.append(Finding("BID_STRATEGY_PREF", Severity.MAJOR, "CAMPAIGN", _id(c), "Not using eCPC.","Prefer eCPC for launch."))
+
+    # 6) Extensions (placeholder presence only in MVP)
+    f.append(Finding("EXTENSIONS_CHECK", Severity.MAJOR, "ACCOUNT", acct_id,
+                    "Extensions presence not verified in MVP.", "Add sitelinks/callouts/snippets/images (to be implemented)."))
+
+    # 8) Import Audit (URL quick sanity)
+    bad = []
+    for agid, ads in ads_by_ag.items():
+        for a in ads:
+            urls = _get(a,"FinalUrls",[]) or []
+            if any(("google.com" in (u or "").lower()) for u in urls):
+                bad.append({"ad_id": _id(a), "url": urls[0] if urls else ""})
+    if bad:
+        f.append(Finding("FINAL_URL_REPLACEMENT", Severity.MAJOR, "ACCOUNT", acct_id,
+                         "Some ads still use google.com URLs.","Replace with correct final URLs.", {"examples": bad[:10]}))
+    else:
+        f.append(Finding("FINAL_URL_OK", Severity.PASS, "ACCOUNT", acct_id, "Final URLs look OK (no google.com).","None."))
+    return f
+
+# ---------- Orchestration ----------
+def fetch_snapshot(naming_regex: str) -> Dict:
+    auth = build_auth()
+    campaigns = get_campaigns(auth)
+    ad_groups_by_campaign = {}
+    ads_by_ag, kws_by_ag = {}, {}
+    for c in campaigns:
+        cid = _id(c)
+        ags = get_ad_groups(auth, int(cid))
+        ad_groups_by_campaign[cid] = ags
+        for ag in ags:
+            agid = _id(ag)
+            ads_by_ag[agid] = get_ads(auth, int(agid))
+            kws_by_ag[agid] = get_keywords(auth, int(agid))
+    acct_props = get_account_props(auth)
+    return {
+        "account_id": str(auth.account_id),
+        "account_props": acct_props,
+        "campaigns": campaigns,
+        "ad_groups_by_campaign": ad_groups_by_campaign,
+        "ads_by_ag": ads_by_ag,
+        "kws_by_ag": kws_by_ag,
+        "naming_regex": naming_regex
+    }
+
+def score_findings(findings: List[Finding]) -> Score:
+    base = 100
+    # Count unique rules (excluding PASS rows) for pass/total display
+    rule_ids = {f.rule_id for f in findings if f.severity != Severity.PASS}
+    total = len(rule_ids) if rule_ids else 1
+    failed = {f.rule_id for f in findings if f.severity in (Severity.CRITICAL, Severity.MAJOR)}
+    passed = max(0, total - len(failed))
+    penalty = sum(WEIGHTS[f.severity] for f in findings if f.severity != Severity.PASS)
+    s = max(0, base - penalty)
+    status = "LAUNCH_READY" if s>=85 and not any(f.severity==Severity.CRITICAL for f in findings) else ("REVIEW_REQUIRED" if s>=70 else "FAIL")
+    return Score(score=s, status=status, passed=passed, total=total)
+
+# ---------- Report ----------
+def render_html(findings: List[Finding], sc: Score) -> str:
+    def row_color(sev):
+        return {Severity.CRITICAL:"#ffe6e6", Severity.MAJOR:"#fff9e6", Severity.PASS:"#e9f7ef"}.get(sev,"#fff")
+    rows = []
+    for f in findings:
+        rows.append(f"<tr style='background:{row_color(f.severity)}'><td>{f.severity}</td><td>{f.rule_id}</td>"
+                    f"<td>{f.entity_type} {f.entity_id}</td><td>{f.message}</td><td>{f.recommendation}</td></tr>")
+    if not rows: rows = ["<tr><td colspan='5'>No findings 🎉</td></tr>"]
+    return f"""<!doctype html><html><head><meta charset="utf-8"><title>QC Report</title>
+<style>body{{font-family:Arial;margin:24px}}table{{border-collapse:collapse;width:100%}}
+th,td{{border:1px solid #ddd;padding:8px;vertical-align:top}}th{{background:#f5f5f5}}
+.badge{{display:inline-block;padding:4px 8px;border-radius:6px;background:#efefef;margin-right:6px}}</style></head><body>
+<h2>QC Report</h2>
+<p><span class="badge"><b>Score:</b> {sc.score}</span>
+<span class="badge"><b>Status:</b> {sc.status}</span>
+<span class="badge"><b>Checks:</b> {sc.passed}/{sc.total} passed</span></p>
+<table><tr><th>Severity</th><th>Rule</th><th>Entity</th><th>Finding</th><th>Recommendation</th></tr>
+{''.join(rows)}</table></body></html>"""
+
+# ---------- CLI ----------
+def main():
+    ap = argparse.ArgumentParser(description="Bing Ads QC – Single-file MVP")
+    ap.add_argument("--naming-template", default=r"^(Platform)_(CampaignType)_(Objective)_(Targeting)_[A-Za-z0-9-]+$")
+    ap.add_argument("--html", default="qc_report.html")
+    ap.add_argument("--json", default="qc_report.json")
+    args = ap.parse_args()
+
+    snap = fetch_snapshot(args.naming_template)
+    findings = evaluate(snap, args.naming_template)
+    sc = score_findings(findings)
+
+    print(f"Score: {sc.score}  Status: {sc.status}  Checks: {sc.passed}/{sc.total} passed")
+    for f in findings:
+        print(f"- [{f.severity}] {f.rule_id} :: {f.entity_type} {f.entity_id} :: {f.message}")
+
+    with open(args.json, "w", encoding="utf-8") as fp:
+        json.dump({"score": sc.__dict__, "findings": [f.__dict__ for f in findings]}, fp, indent=2)
+    with open(args.html, "w", encoding="utf-8") as fp:
+        fp.write(render_html(findings, sc))
+
+if __name__ == "__main__":
+    main()
+
